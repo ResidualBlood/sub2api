@@ -304,27 +304,30 @@ func TestBuildGenerationConfig_Gemini3UsesThinkingLevel(t *testing.T) {
 	tests := []struct {
 		name      string
 		model     string
+		maxTokens int
 		budget    int
 		wantLevel string
 	}{
-		{name: "tiered suffix uses budget fallback", model: "gemini-3.8-flash-tiered", budget: 1024, wantLevel: "low"},
-		{name: "high suffix wins over small budget", model: "gemini-3.8-flash-high", budget: 512, wantLevel: "high"},
-		{name: "medium suffix", model: "gemini-3.6-flash-medium", budget: 20000, wantLevel: "medium"},
-		{name: "low suffix", model: "gemini-3.1-pro-low", budget: 20000, wantLevel: "low"},
-		{name: "bare id uses budget fallback low", model: "gemini-3.8-flash", budget: 1024, wantLevel: "low"},
-		{name: "bare id uses budget fallback medium", model: "gemini-3.8-flash", budget: 4096, wantLevel: "medium"},
+		{name: "tiered suffix uses budget fallback", model: "gemini-3.8-flash-tiered", maxTokens: 1000, budget: 1024, wantLevel: "low"},
+		{name: "high suffix wins over small budget", model: "gemini-3.8-flash-high", maxTokens: 1000, budget: 512, wantLevel: "high"},
+		{name: "medium suffix", model: "gemini-3.6-flash-medium", maxTokens: 1000, budget: 20000, wantLevel: "medium"},
+		{name: "low suffix", model: "gemini-3.1-pro-low", maxTokens: 1000, budget: 20000, wantLevel: "low"},
+		{name: "bare id uses budget fallback low", model: "gemini-3.8-flash", maxTokens: 1000, budget: 1024, wantLevel: "low"},
+		{name: "bare id uses budget fallback medium", model: "gemini-3.8-flash", maxTokens: 1000, budget: 4096, wantLevel: "medium"},
+		{name: "small max_tokens clamps to minimal to protect visible text", model: "gemini-3.8-flash-high", maxTokens: 32, budget: 4096, wantLevel: "minimal"},
+		{name: "boundary 64 max_tokens clamps to minimal", model: "gemini-3.8-flash", maxTokens: 64, budget: 4096, wantLevel: "minimal"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := buildGenerationConfig(&ClaudeRequest{
 				Model:     tc.model,
-				MaxTokens: 64,
+				MaxTokens: tc.maxTokens,
 				Thinking:  &ThinkingConfig{Type: "enabled", BudgetTokens: tc.budget},
 			})
 			require.NotNil(t, cfg.ThinkingConfig)
 			require.Equal(t, tc.wantLevel, cfg.ThinkingConfig.ThinkingLevel)
 			require.Zero(t, cfg.ThinkingConfig.ThinkingBudget)
-			require.Equal(t, 64, cfg.MaxOutputTokens)
+			require.Equal(t, tc.maxTokens, cfg.MaxOutputTokens)
 		})
 	}
 

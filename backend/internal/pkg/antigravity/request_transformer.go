@@ -716,6 +716,11 @@ func buildGenerationConfig(req *ClaudeRequest) *GeminiGenerationConfig {
 		// Gemini 3.x 用 thinkingLevel。正的 thinkingBudget 会占满 maxOutputTokens，
 		// 小的 max_tokens 会把正文截成空，上游也不稳定返回思考摘要。
 		if level, ok := gemini3ThinkingLevel(req.Model, req.Thinking.BudgetTokens); ok {
+			// 当 max_tokens 极端微小 (<=64) 时，思考 token 会占满整个 maxOutputTokens 导致正文截断为空，
+			// 此时强制使用 minimal 思考级别，优先保全正文输出。
+			if config.MaxOutputTokens > 0 && config.MaxOutputTokens <= 64 {
+				level = "minimal"
+			}
 			config.ThinkingConfig.ThinkingLevel = level
 		} else {
 			// - thinking.type=enabled：budget_tokens>0 用显式预算
