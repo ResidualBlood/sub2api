@@ -170,9 +170,7 @@ func (s *antigravityCompatStreamSession) finish() (*antigravityStreamResult, err
 	s.consumeClaudeEvents(finalEvents)
 	if !s.hasMeaningfulData() && !s.writer.Disconnected() {
 		if s.preContentKeepaliveSent {
-			// HTTP 200 is already committed. An SSE empty_stream is counted as
-			// success by downstream proxies, so close without that error frame.
-			return s.result(false), errors.New("empty Antigravity compatibility stream after keepalive")
+			return s.committedEmptyStream()
 		}
 		return nil, antigravityCompatEmptyStreamError(s.processor.MalformedFunctionCallOnly())
 	}
@@ -390,11 +388,17 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStreamWithKeepaliveIn
 
 func handleAntigravityCompatEmptyStream(c *gin.Context, session *antigravityCompatStreamSession) (*antigravityStreamResult, error) {
 	if session.preContentKeepaliveSent {
-		// HTTP 200 is already committed. An SSE empty_stream is counted as
-		// success by downstream proxies, so close without that error frame.
-		return session.collectResult(false), errors.New("empty Antigravity compatibility stream after keepalive")
+		return session.committedEmptyStream()
 	}
 	return nil, antigravityCompatEmptyStreamError(session.processor.MalformedFunctionCallOnly())
+}
+
+// committedEmptyStream reports an empty stream after HTTP 200 is already
+// committed. The SSE frame must be a real error event: a bare close is counted
+// as a successful completion by downstream proxies.
+func (s *antigravityCompatStreamSession) committedEmptyStream() (*antigravityStreamResult, error) {
+	s.adapter.WriteError(s.writer, "empty_stream")
+	return s.result(false), errors.New("empty Antigravity compatibility stream after keepalive")
 }
 
 func (s *AntigravityGatewayService) startAntigravityCompatScanner(

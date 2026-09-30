@@ -847,8 +847,8 @@ func TestAntigravityCompatHandlerPreContentKeepalive(t *testing.T) {
 		line    string
 		want    string
 	}{
-		{"silent chat", func() antigravityCompatStreamAdapter { return newAntigravityChatStreamAdapter("gemini-3.1-pro", false) }, "", ""},
-		{"signature-only responses", func() antigravityCompatStreamAdapter { return newAntigravityResponsesStreamAdapter("gemini-3.1-pro") }, `data: {"response":{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig","text":""}]}}]}}` + "\n\n", ""},
+		{"silent chat", func() antigravityCompatStreamAdapter { return newAntigravityChatStreamAdapter("gemini-3.1-pro", false) }, "", `"upstream_error"`},
+		{"signature-only responses", func() antigravityCompatStreamAdapter { return newAntigravityResponsesStreamAdapter("gemini-3.1-pro") }, `data: {"response":{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig","text":""}]}}]}}` + "\n\n", "event: error"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize, StreamDataIntervalTimeout: 30}, nil)
@@ -876,10 +876,8 @@ func TestAntigravityCompatHandlerPreContentKeepalive(t *testing.T) {
 			require.Equal(t, ": ping\n\n", recorder.Body.String())
 			require.NoError(t, pipeWriter.Close())
 			require.Error(t, <-done)
-			require.Equal(t, ": ping\n\n", recorder.Body.String())
-			if tt.want != "" {
-				require.Contains(t, recorder.Body.String(), tt.want)
-			}
+			require.Contains(t, recorder.Body.String(), tt.want)
+			require.Greater(t, strings.Index(recorder.Body.String(), tt.want), strings.Index(recorder.Body.String(), ": ping"))
 			require.True(t, IsResponseCommitted(c))
 		})
 	}
@@ -1002,14 +1000,15 @@ func TestAntigravityCompatHandlerErrorsAfterPreContentPing(t *testing.T) {
 	}
 }
 
-func TestAntigravityCompatEmptyAfterKeepaliveDoesNotEmitSuccessError(t *testing.T) {
+func TestAntigravityCompatEmptyAfterKeepaliveReportsStreamError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, tt := range []struct {
 		name    string
 		adapter antigravityCompatStreamAdapter
+		want    string
 	}{
-		{"chat completions", newAntigravityChatStreamAdapter("gemini-3.1-pro", false)},
-		{"responses", newAntigravityResponsesStreamAdapter("gemini-3.1-pro")},
+		{"chat completions", newAntigravityChatStreamAdapter("gemini-3.1-pro", false), `"upstream_error"`},
+		{"responses", newAntigravityResponsesStreamAdapter("gemini-3.1-pro"), "event: error"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c, recorder := newAntigravityCompatContext(http.MethodPost, "/", nil)
@@ -1024,10 +1023,9 @@ func TestAntigravityCompatEmptyAfterKeepaliveDoesNotEmitSuccessError(t *testing.
 			var failoverErr *UpstreamFailoverError
 			require.NotErrorAs(t, err, &failoverErr)
 			require.NotNil(t, result)
-			require.True(t, IsResponseCommitted(c))
-			require.Equal(t, ": ping\n\n", recorder.Body.String())
-			require.NotContains(t, recorder.Body.String(), "empty_stream")
-			require.NotContains(t, recorder.Body.String(), "upstream_error")
+			require.Contains(t, recorder.Body.String(), ": ping\n\n")
+			require.Contains(t, recorder.Body.String(), tt.want)
+			require.Contains(t, recorder.Body.String(), "empty_stream")
 		})
 	}
 }
