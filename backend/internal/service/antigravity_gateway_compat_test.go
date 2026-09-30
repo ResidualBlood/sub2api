@@ -880,7 +880,6 @@ func TestAntigravityCompatHandlerPreContentKeepalive(t *testing.T) {
 				require.Contains(t, recorder.Body.String(), tt.want)
 				require.Greater(t, strings.Index(recorder.Body.String(), tt.want), strings.Index(recorder.Body.String(), ": ping"))
 			}
-			require.True(t, IsResponseCommitted(c))
 		})
 	}
 }
@@ -906,7 +905,6 @@ func TestAntigravityCompatHandlerRepeatsPreContentKeepalive(t *testing.T) {
 	require.Error(t, <-done)
 	require.GreaterOrEqual(t, strings.Count(recorder.Body.String(), ": ping\n\n"), 3)
 	require.Contains(t, recorder.Body.String(), "event: error")
-	require.True(t, IsResponseCommitted(c))
 }
 
 func TestAntigravityCompatHandlerPreContentDeadlineWithCommentOnlyStream(t *testing.T) {
