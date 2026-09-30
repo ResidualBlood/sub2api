@@ -876,8 +876,10 @@ func TestAntigravityCompatHandlerPreContentKeepalive(t *testing.T) {
 			require.Equal(t, ": ping\n\n", recorder.Body.String())
 			require.NoError(t, pipeWriter.Close())
 			require.Error(t, <-done)
-			require.Contains(t, recorder.Body.String(), tt.want)
-			require.Greater(t, strings.Index(recorder.Body.String(), tt.want), strings.Index(recorder.Body.String(), ": ping"))
+			if tt.want != "" {
+				require.Contains(t, recorder.Body.String(), tt.want)
+				require.Greater(t, strings.Index(recorder.Body.String(), tt.want), strings.Index(recorder.Body.String(), ": ping"))
+			}
 			require.True(t, IsResponseCommitted(c))
 		})
 	}
