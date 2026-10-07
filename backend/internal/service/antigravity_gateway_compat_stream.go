@@ -163,7 +163,7 @@ func (s *antigravityCompatStreamSession) noteFinishReason(line string) {
 		return
 	}
 	reason := antigravityCompatCandidateFinishReason(line)
-	if reason == "" || isGeminiContentFilterFinishReason(reason) {
+	if reason == "" || isGeminiContentFilterFinishReason(reason) || reason == "MALFORMED_FUNCTION_CALL" {
 		return
 	}
 	s.sawFinishReason = true
