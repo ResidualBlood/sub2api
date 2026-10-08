@@ -467,10 +467,28 @@ func buildContents(messages []ClaudeMessage, toolIDToName map[string]string, isT
 			continue
 		}
 
+		// 合并连续相同 role 的消息，避免 Google Code Assist 报
+		// "Please ensure that multiturn requests alternate between user and model."
+		if n := len(contents); n > 0 && contents[n-1].Role == role {
+			contents[n-1].Parts = append(contents[n-1].Parts, parts...)
+			continue
+		}
+
 		contents = append(contents, GeminiContent{
 			Role:  role,
 			Parts: parts,
 		})
+	}
+
+	// 历史轮次清洗：
+	// 1. 若经过过滤后首个回合是 model 且后面还有其它消息（例如 Agent 压包截断上下文残留），
+	//    Google Code Assist 要求必须以 user 开头，否则报 400，自动垫入前置 user 说明。
+	//    注意：若请求原本就仅有 1 条 model 消息（如 prefill 测试用例），保留原状。
+	if len(contents) > 1 && contents[0].Role == "model" {
+		contents = append([]GeminiContent{{
+			Role:  "user",
+			Parts: []GeminiPart{{Text: "[Continuing from previous AI thoughts...]"}},
+		}}, contents...)
 	}
 
 	return contents, systemParts, strippedThinking, nil

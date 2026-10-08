@@ -41,6 +41,10 @@ type StreamingProcessor struct {
 	cacheReadTokens   int
 	imageOutputTokens int
 	hasContent        bool
+
+	// textCallBuffer 用于跨 chunk 缓冲与识别模型在文本正文中输出的伪工具调用
+	// 例如: call:default_api:bash{command: "ls"}
+	textCallBuffer string
 }
 
 // NewStreamingProcessor 创建流式响应处理器
@@ -164,6 +168,14 @@ func (p *StreamingProcessor) Finish() ([]byte, *ClaudeUsage) {
 	}
 
 	var result bytes.Buffer
+
+	// 如果 textCallBuffer 还有未排出的剩余文本（不是合法的伪调用），排出为普通文本
+	if p.textCallBuffer != "" {
+		remaining := p.textCallBuffer
+		p.textCallBuffer = ""
+		_, _ = result.Write(p.emitPlainText(remaining))
+	}
+
 	if !p.messageStopSent {
 		_, _ = result.Write(p.emitFinish(""))
 	}
@@ -319,8 +331,6 @@ func (p *StreamingProcessor) processThinking(text, signature string) []byte {
 
 // processText 处理普通 text
 func (p *StreamingProcessor) processText(text, signature string) []byte {
-	var result bytes.Buffer
-
 	// 空 text 带签名 - 暂存
 	if text == "" {
 		if signature != "" {
@@ -329,41 +339,187 @@ func (p *StreamingProcessor) processText(text, signature string) []byte {
 		return nil
 	}
 
-	// 处理之前的 trailingSignature
+	// 签名非空时直接走标准文本逻辑（不参与伪调用缓存）
+	if signature != "" {
+		var result bytes.Buffer
+		if p.textCallBuffer != "" {
+			prev := p.textCallBuffer
+			p.textCallBuffer = ""
+			_, _ = result.Write(p.emitPlainText(prev))
+		}
+		_, _ = result.Write(p.emitTextWithSignature(text, signature))
+		return result.Bytes()
+	}
+
+	return p.processBufferedText(text)
+}
+
+func (p *StreamingProcessor) emitTextWithSignature(text, signature string) []byte {
+	var result bytes.Buffer
 	if p.trailingSignature != "" {
 		_, _ = result.Write(p.endBlock())
 		_, _ = result.Write(p.emitEmptyThinkingWithSignature(p.trailingSignature))
 		p.trailingSignature = ""
 	}
+	_, _ = result.Write(p.startBlock(BlockTypeText, map[string]any{
+		"type": "text",
+		"text": "",
+	}))
+	_, _ = result.Write(p.emitDelta("text_delta", map[string]any{
+		"text": text,
+	}))
+	_, _ = result.Write(p.endBlock())
+	_, _ = result.Write(p.emitEmptyThinkingWithSignature(signature))
+	return result.Bytes()
+}
 
-	// 非空 text 带签名 - 特殊处理
-	if signature != "" {
-		_, _ = result.Write(p.startBlock(BlockTypeText, map[string]any{
-			"type": "text",
-			"text": "",
-		}))
-		_, _ = result.Write(p.emitDelta("text_delta", map[string]any{
-			"text": text,
-		}))
-		_, _ = result.Write(p.endBlock())
-		_, _ = result.Write(p.emitEmptyThinkingWithSignature(signature))
-		return result.Bytes()
+func (p *StreamingProcessor) emitPlainText(text string) []byte {
+	if text == "" {
+		return nil
 	}
-
-	// 普通 text (无签名)
+	var result bytes.Buffer
+	if p.trailingSignature != "" {
+		_, _ = result.Write(p.endBlock())
+		_, _ = result.Write(p.emitEmptyThinkingWithSignature(p.trailingSignature))
+		p.trailingSignature = ""
+	}
 	if p.blockType != BlockTypeText {
 		_, _ = result.Write(p.startBlock(BlockTypeText, map[string]any{
 			"type": "text",
 			"text": "",
 		}))
 	}
-
 	p.hasContent = true
 	_, _ = result.Write(p.emitDelta("text_delta", map[string]any{
 		"text": text,
 	}))
+	return result.Bytes()
+}
+
+const (
+	geminiCallMarker = "call:default_api:"
+	maxHeldCallLen   = 256 << 10
+)
+
+// processBufferedText 维护状态机，检测并抢救文本中裸输出的伪工具调用
+func (p *StreamingProcessor) processBufferedText(text string) []byte {
+	s := p.textCallBuffer + text
+	p.textCallBuffer = ""
+
+	var result bytes.Buffer
+
+	for s != "" {
+		idx := strings.Index(s, geminiCallMarker)
+		if idx < 0 {
+			// 未包含完整 marker，但末尾可能只是 marker 的前缀片段，做尾部暂存
+			k := len(geminiCallMarker) - 1
+			for ; k > 0 && !strings.HasSuffix(s, geminiCallMarker[:k]); k-- {
+			}
+			emitPart := s[:len(s)-k]
+			_, _ = result.Write(p.emitPlainText(emitPart))
+			p.textCallBuffer = s[len(s)-k:]
+			return result.Bytes()
+		}
+
+		// marker 前面的普通文本直接发出
+		if idx > 0 {
+			_, _ = result.Write(p.emitPlainText(s[:idx]))
+		}
+		s = s[idx:]
+
+		callName, args, consumed := parsePseudoTextCall(s)
+		switch {
+		case consumed == 0 && len(s) < maxHeldCallLen:
+			// 疑似伪工具调用但尚未接收完整，暂存至缓冲区等待后续 chunk
+			p.textCallBuffer = s
+			return result.Bytes()
+		case consumed <= 0:
+			// 不是合法伪调用，当普通文本吐出 marker 首段，继续后移
+			_, _ = result.Write(p.emitPlainText(s[:len(geminiCallMarker)]))
+			s = s[len(geminiCallMarker):]
+		default:
+			// 成功识别出伪工具调用，转换为标准的 Claude tool_use 事件下发
+			if p.blockType != BlockTypeNone {
+				_, _ = result.Write(p.endBlock())
+			}
+			fc := &GeminiFunctionCall{
+				Name: callName,
+				Args: args,
+				ID:   fmt.Sprintf("call_%s", generateRandomID()),
+			}
+			_, _ = result.Write(p.processFunctionCall(fc, ""))
+			s = s[consumed:]
+		}
+	}
 
 	return result.Bytes()
+}
+
+func isCallIdent(c byte) bool {
+	return c == '_' || c == '-' || c == '.' || ('0' <= c && c <= '9') || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
+}
+
+// parsePseudoTextCall 解析 call:default_api:<tool>{<args>} 格式
+func parsePseudoTextCall(s string) (string, map[string]any, int) {
+	j := len(geminiCallMarker)
+	for j < len(s) && isCallIdent(s[j]) {
+		j++
+	}
+	if j == len(s) {
+		return "", nil, 0
+	}
+	name := s[len(geminiCallMarker):j]
+	if name == "" || s[j] != '{' {
+		return "", nil, -1
+	}
+
+	end := findClosingBrace(s, j)
+	if end < 0 {
+		return "", nil, 0
+	}
+
+	argsRaw := strings.TrimSpace(s[j : end+1])
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsRaw), &args); err != nil {
+		// 容错: 某些伪调用可能没有引号或参数异常，放宽解析
+		return "", nil, -1
+	}
+
+	return name, args, end + 1
+}
+
+func findClosingBrace(s string, start int) int {
+	depth := 0
+	inString := false
+	var escape bool
+
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if c == '\\' {
+			escape = true
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // processFunctionCall 处理 function call
