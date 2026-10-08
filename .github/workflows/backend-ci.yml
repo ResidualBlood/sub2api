@@ -25,9 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: golang:1.27.0
-      options: --network host
-    env:
-      TESTCONTAINERS_HOST_OVERRIDE: localhost
     steps:
       - uses: actions/checkout@v6
       - name: Check Docker Compose simple mode environment
@@ -47,7 +44,16 @@ jobs:
         run: make test-unit
       - name: Integration tests
         working-directory: backend
-        run: make test-integration
+        shell: bash
+        run: |
+          while read -r iface destination gateway rest; do
+            if [[ "$destination" == 00000000 ]]; then
+              printf -v TESTCONTAINERS_HOST_OVERRIDE '%d.%d.%d.%d' "0x${gateway:6:2}" "0x${gateway:4:2}" "0x${gateway:2:2}" "0x${gateway:0:2}"
+              export TESTCONTAINERS_HOST_OVERRIDE
+              break
+            fi
+          done < /proc/net/route
+          make test-integration
 
   frontend:
     runs-on: ubuntu-latest
