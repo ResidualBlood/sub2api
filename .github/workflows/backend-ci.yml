@@ -27,6 +27,12 @@ jobs:
       image: golang:1.27.0
     steps:
       - uses: actions/checkout@v6
+      - name: Install Docker CLI and verify daemon access
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends docker-cli
+          docker version
+          docker info
       - uses: actions/cache@v6
         with:
           path: |
