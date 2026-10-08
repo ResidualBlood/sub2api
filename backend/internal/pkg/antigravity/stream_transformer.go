@@ -510,9 +510,10 @@ func findClosingBrace(s string, start int) int {
 		if inString {
 			continue
 		}
-		if c == '{' {
+		switch c {
+		case '{':
 			depth++
-		} else if c == '}' {
+		case '}':
 			depth--
 			if depth == 0 {
 				return i
