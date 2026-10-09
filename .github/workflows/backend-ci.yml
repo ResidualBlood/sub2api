@@ -24,7 +24,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container:
-      image: golang:1.27.0
+      image: golang:1.27.2
     steps:
       - uses: actions/checkout@v6
       - name: Install Docker CLI and verify daemon access
@@ -38,8 +38,8 @@ jobs:
           path: |
             /go/pkg/mod
             /root/.cache/go-build
-          key: go-container-1.27.0-${{ runner.os }}-${{ hashFiles('backend/go.sum') }}
-          restore-keys: go-container-1.27.0-${{ runner.os }}-
+          key: go-container-1.27.2-${{ runner.os }}-${{ hashFiles('backend/go.sum') }}
+          restore-keys: go-container-1.27.2-${{ runner.os }}-
       - name: Verify Go version
         run: |
           go version | grep -q 'go1.27.2'
@@ -82,7 +82,7 @@ jobs:
   golangci-lint:
     runs-on: ubuntu-latest
     container:
-      image: golang:1.27.0
+      image: golang:1.27.2
     steps:
       - uses: actions/checkout@v6
       - name: Verify Go version
