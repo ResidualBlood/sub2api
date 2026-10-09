@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,14 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+func TestMain(m *testing.M) {
+	origBackoff := antigravityCompatRetryBackoff
+	antigravityCompatRetryBackoff = func() time.Duration { return 0 }
+	code := m.Run()
+	antigravityCompatRetryBackoff = origBackoff
+	os.Exit(code)
+}
 
 type antigravityCompatTokenCache struct {
 	token string
@@ -1206,7 +1215,7 @@ func TestAntigravityCompatRecoveryIsBounded(t *testing.T) {
 		newAntigravityChatStreamAdapter("gemini-3.8-flash-medium", true), "test", time.Hour, time.Minute,
 		func() (*http.Response, error) { calls++; return empty(), nil })
 	require.Error(t, err)
-	require.Equal(t, 2, calls)
+	require.Equal(t, antigravityCompatMaxStreamAttempts-1, calls)
 	require.Equal(t, 502, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "empty_stream")
 	require.NotContains(t, recorder.Body.String(), `"finish_reason":"stop"`)
@@ -1224,7 +1233,7 @@ func TestAntigravityCompatRecoveryExhaustedAfterHeartbeat(t *testing.T) {
 		newAntigravityResponsesStreamAdapter("gemini-3.1-pro"), "test", time.Hour, time.Minute,
 		func() (*http.Response, error) { calls++; return empty(), nil })
 	require.Error(t, err)
-	require.Equal(t, 2, calls)
+	require.Equal(t, antigravityCompatMaxStreamAttempts-1, calls)
 	require.Contains(t, recorder.Body.String(), "event: error")
 	require.NotContains(t, recorder.Body.String(), "response.completed")
 }
