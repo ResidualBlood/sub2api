@@ -260,7 +260,7 @@ func (s *AntigravityGatewayService) prepareAntigravityCompatCall(
 	mappedModel := s.getMappedModelForThinkingLevel(
 		account,
 		request.originalModel,
-		geminiThinkingLevelFromClaudeThinking(claudeRequest.Thinking),
+		geminiThinkingLevelFromClaudeBody(request.claudeBody, claudeRequest.Thinking),
 	)
 	if mappedModel == "" {
 		MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalFeatureGate)
@@ -323,6 +323,7 @@ func (s *AntigravityGatewayService) buildAntigravityCompatGeminiBody(
 			return nil, err
 		}
 		body = ensureGeminiFunctionCallThoughtSignatures(body)
+		body = applyGeminiCompatThinkingConfig(body, claudeBody, mappedModel, claudeRequest != nil && claudeRequest.Stream)
 		body, err = injectIdentityPatchToGeminiRequest(body)
 		if err != nil {
 			return nil, err
@@ -450,9 +451,13 @@ func (s *AntigravityGatewayService) consumeAntigravityCompatResponse(
 		if call.request.protocol == antigravityCompatChatCompletions {
 			adapter = newAntigravityChatStreamAdapter(call.request.originalModel, call.request.includeUsage)
 		}
+		// Anchor the shared first-content deadline at response-header arrival,
+		// matching upstream's after-headers stream timing.
+		streamStart := time.Now()
+		maxPreContentWait := s.antigravityCompatPreContentMaxWait()
 		retry := func() (*http.Response, error) {
 			// All attempts share the first-content deadline and client cancellation.
-			retryCtx, cancel := context.WithDeadline(ctx, call.request.startTime.Add(antigravityCompatPreContentMaxWait))
+			retryCtx, cancel := context.WithDeadline(ctx, streamStart.Add(maxPreContentWait))
 			// The returned body must retain its context until it is consumed.
 			// One HTTP attempt per recovery: do not nest the transport's retry
 			// loop inside the stream retry budget or mutate account scheduling.
@@ -473,8 +478,9 @@ func (s *AntigravityGatewayService) consumeAntigravityCompatResponse(
 			next.Body = &antigravityRetryBody{ReadCloser: next.Body, cancel: cancel}
 			return next, nil
 		}
-		streamResult, err = s.handleAntigravityCompatStream(c, resp, call.request.startTime,
-			call.request.originalModel, adapter, call.prefix, retry)
+		streamResult, err = s.handleAntigravityCompatStreamWithTiming(c, resp, call.request.startTime, streamStart,
+			call.request.originalModel, adapter, call.prefix,
+			s.antigravityCompatPreContentKeepaliveInterval(), maxPreContentWait, retry)
 	} else {
 		streamResult, err = s.consumeAntigravityCompatSuccess(c, call, resp)
 	}

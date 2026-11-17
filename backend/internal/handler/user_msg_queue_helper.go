@@ -27,7 +27,7 @@ func NewUserMsgQueueHelper(
 	pingFormat SSEPingFormat,
 	pingInterval time.Duration,
 ) *UserMsgQueueHelper {
-	if pingInterval <= 0 {
+	if pingInterval < 0 {
 		pingInterval = defaultPingInterval
 	}
 	return &UserMsgQueueHelper{
@@ -87,7 +87,7 @@ func (h *UserMsgQueueHelper) waitForLockWithPing(
 	reqLog *zap.Logger,
 ) (func(), error) {
 	pingFormat := queuePingFormat(c, h.pingFormat)
-	needPing := isStream && pingFormat != ""
+	needPing := isStream && pingFormat != "" && h.pingInterval > 0
 
 	var flusher http.Flusher
 	if needPing {
@@ -198,7 +198,7 @@ func (h *UserMsgQueueHelper) ThrottleWithPing(
 
 	// 延迟期间发送 SSE ping（复用 waitForLockWithPing 的 ping 逻辑）
 	pingFormat := queuePingFormat(c, h.pingFormat)
-	needPing := isStream && pingFormat != ""
+	needPing := isStream && pingFormat != "" && h.pingInterval > 0
 	var flusher http.Flusher
 	if needPing {
 		flusher, _ = c.Writer.(http.Flusher)
