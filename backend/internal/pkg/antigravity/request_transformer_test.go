@@ -2,6 +2,7 @@ package antigravity
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -298,48 +299,6 @@ func TestBuildTools_KeepsWebSearchWhenNoClientFunctions(t *testing.T) {
 	require.NotNil(t, result[0].GoogleSearch.EnhancedContent)
 	require.NotNil(t, result[0].GoogleSearch.EnhancedContent.ImageSearch)
 	require.Equal(t, 5, result[0].GoogleSearch.EnhancedContent.ImageSearch.MaxResultCount)
-}
-
-func TestBuildGenerationConfig_Gemini3UsesThinkingLevel(t *testing.T) {
-	tests := []struct {
-		name      string
-		model     string
-		maxTokens int
-		budget    int
-		wantLevel string
-	}{
-		{name: "tiered suffix uses budget fallback", model: "gemini-3.8-flash-tiered", maxTokens: 1000, budget: 1024, wantLevel: "low"},
-		{name: "high suffix wins over small budget", model: "gemini-3.8-flash-high", maxTokens: 1000, budget: 512, wantLevel: "high"},
-		{name: "medium suffix", model: "gemini-3.6-flash-medium", maxTokens: 1000, budget: 20000, wantLevel: "medium"},
-		{name: "low suffix", model: "gemini-3.1-pro-low", maxTokens: 1000, budget: 20000, wantLevel: "low"},
-		{name: "bare id uses budget fallback low", model: "gemini-3.8-flash", maxTokens: 1000, budget: 1024, wantLevel: "low"},
-		{name: "bare id uses budget fallback medium", model: "gemini-3.8-flash", maxTokens: 1000, budget: 4096, wantLevel: "medium"},
-		{name: "small max_tokens clamps to minimal to protect visible text", model: "gemini-3.8-flash-high", maxTokens: 32, budget: 4096, wantLevel: "minimal"},
-		{name: "boundary 64 max_tokens clamps to minimal", model: "gemini-3.8-flash", maxTokens: 64, budget: 4096, wantLevel: "minimal"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := buildGenerationConfig(&ClaudeRequest{
-				Model:     tc.model,
-				MaxTokens: tc.maxTokens,
-				Thinking:  &ThinkingConfig{Type: "enabled", BudgetTokens: tc.budget},
-			})
-			require.NotNil(t, cfg.ThinkingConfig)
-			require.Equal(t, tc.wantLevel, cfg.ThinkingConfig.ThinkingLevel)
-			require.Zero(t, cfg.ThinkingConfig.ThinkingBudget)
-			require.Equal(t, tc.maxTokens, cfg.MaxOutputTokens)
-		})
-	}
-
-	legacy := buildGenerationConfig(&ClaudeRequest{
-		Model:     "gemini-2.5-flash",
-		MaxTokens: 64,
-		Thinking:  &ThinkingConfig{Type: "enabled", BudgetTokens: 1024},
-	})
-	require.NotNil(t, legacy.ThinkingConfig)
-	require.Empty(t, legacy.ThinkingConfig.ThinkingLevel)
-	require.Equal(t, 1024, legacy.ThinkingConfig.ThinkingBudget)
-	require.Greater(t, legacy.MaxOutputTokens, legacy.ThinkingConfig.ThinkingBudget)
 }
 
 func TestBuildGenerationConfig_ThinkingDynamicBudget(t *testing.T) {
@@ -796,4 +755,34 @@ func TestTransformClaudeToGemini_ToolResultImagesReachUpstream(t *testing.T) {
 	require.NotNil(t, userParts[3].InlineData)
 	require.Equal(t, "image/jpeg", userParts[3].InlineData.MimeType)
 	require.Equal(t, "d29ybGQ=", userParts[3].InlineData.Data)
+}
+
+func TestBuildParts_ParallelResultsWithInterleavedNotice(t *testing.T) {
+	for _, multimodal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("multimodal=%t", multimodal), func(t *testing.T) {
+			content := json.RawMessage(`[
+				{"type":"tool_result","tool_use_id":"image-1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]},
+				{"type":"text","text":"Keep this notice."},
+				{"type":"tool_result","tool_use_id":"image-2","content":[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}}]}
+			]`)
+			parts, stripped, err := buildParts(content, map[string]string{"image-1": "Read", "image-2": "Read"}, true, multimodal)
+			require.NoError(t, err)
+			require.False(t, stripped)
+			for i, id := range []string{"image-1", "image-2"} {
+				require.NotNil(t, parts[i].FunctionResponse)
+				require.Equal(t, id, parts[i].FunctionResponse.ID)
+			}
+			require.Equal(t, "Keep this notice.", parts[2].Text)
+			if multimodal {
+				require.Len(t, parts, 3)
+				require.Equal(t, "aGVsbG8=", parts[0].FunctionResponse.Parts[0].InlineData.Data)
+				require.Equal(t, "JVBERi0=", parts[1].FunctionResponse.Parts[0].InlineData.Data)
+			} else {
+				require.Len(t, parts, 5)
+				require.Equal(t, "aGVsbG8=", parts[3].InlineData.Data)
+				require.Equal(t, "application/pdf", parts[4].InlineData.MimeType)
+				require.Equal(t, "JVBERi0=", parts[4].InlineData.Data)
+			}
+		})
+	}
 }

@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
@@ -117,29 +115,15 @@ type antigravityCompatStreamSession struct {
 	firstTokenMs                *int
 	startTime                   time.Time
 	meaningfulData              bool
-	terminalReason              string
 	preContentKeepaliveSent     bool
 	preContentKeepaliveInterval time.Duration
 }
 
 const (
-	antigravityCompatMaxStreamAttempts           = 4
 	antigravityCompatPreContentKeepaliveInterval = 15 * time.Second
 	// Allow slow first tokens, but do not let comment-only streams reset the idle timer forever.
 	antigravityCompatPreContentMaxWait = 2 * time.Minute
-	antigravityCompatMinRetryBackoff   = 300 * time.Millisecond
-	antigravityCompatMaxRetryBackoff   = 800 * time.Millisecond
 )
-
-var antigravityCompatRetryBackoff = defaultAntigravityCompatRetryBackoff
-
-func defaultAntigravityCompatRetryBackoff() time.Duration {
-	span := int64(antigravityCompatMaxRetryBackoff - antigravityCompatMinRetryBackoff)
-	if span <= 0 {
-		return antigravityCompatMinRetryBackoff
-	}
-	return antigravityCompatMinRetryBackoff + time.Duration(rand.Int64N(span+1))
-}
 
 func newAntigravityCompatStreamSession(
 	model string,
@@ -158,7 +142,6 @@ func newAntigravityCompatStreamSession(
 }
 
 func (s *antigravityCompatStreamSession) consume(line string) {
-	s.noteFinishReason(line)
 	claudeEvents := s.processor.ProcessLine(strings.TrimRight(line, "\r\n"))
 	if len(claudeEvents) == 0 {
 		return
@@ -167,48 +150,12 @@ func (s *antigravityCompatStreamSession) consume(line string) {
 }
 
 func (s *antigravityCompatStreamSession) hasMeaningfulData() bool {
-	return s.meaningfulData
-}
-
-// A terminal reason is diagnostic metadata, not evidence of usable output.
-func (s *antigravityCompatStreamSession) noteFinishReason(line string) {
-	if reason := antigravityCompatCandidateFinishReason(line); reason != "" {
-		s.terminalReason = reason
-	}
-}
-
-func antigravityCompatCandidateFinishReason(line string) string {
-	data := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "data:"))
-	if data == "" || data == "[DONE]" || !strings.HasPrefix(strings.TrimSpace(line), "data:") {
-		return ""
-	}
-	var wrapped struct {
-		Response *struct {
-			Candidates []struct {
-				FinishReason string `json:"finishReason"`
-			} `json:"candidates"`
-		} `json:"response"`
-		Candidates []struct {
-			FinishReason string `json:"finishReason"`
-		} `json:"candidates"`
-	}
-	if err := json.Unmarshal([]byte(data), &wrapped); err != nil {
-		return ""
-	}
-	candidates := wrapped.Candidates
-	if wrapped.Response != nil {
-		candidates = wrapped.Response.Candidates
-	}
-	if len(candidates) == 0 {
-		return ""
-	}
-	return strings.ToUpper(strings.TrimSpace(candidates[0].FinishReason))
+	return s.meaningfulData || s.processor.HasContent()
 }
 
 func (s *antigravityCompatStreamSession) writePreContentKeepalive(now time.Time) {
-	// Comments commit HTTP 200, so later upstream failures cannot fail over to
-	// another account; the fork still recovers internally on the same account
-	// before content, otherwise they are reported as SSE errors to the client.
+	// Intentional tradeoff: this commits HTTP 200 after the keepalive interval, so later upstream
+	// failures cannot fail over; report them as SSE errors to the client instead.
 	if s.hasMeaningfulData() || s.writer.Disconnected() || (!s.preContentKeepaliveSent && now.Sub(s.startTime) < s.preContentKeepaliveInterval) {
 		return
 	}
@@ -223,9 +170,10 @@ func (s *antigravityCompatStreamSession) finish() (*antigravityStreamResult, err
 	s.consumeClaudeEvents(finalEvents)
 	if !s.hasMeaningfulData() && !s.writer.Disconnected() {
 		if s.preContentKeepaliveSent {
-			return s.committedEmptyStream()
+			s.adapter.WriteError(s.writer, "empty_stream")
+			return s.result(false), newAntigravityCompatCommittedNoContentError("empty Antigravity compatibility stream after keepalive")
 		}
-		return nil, antigravityCompatEmptyStreamError(s.processor.MalformedFunctionCallOnly())
+		return nil, antigravityCompatEmptyStreamError()
 	}
 	s.adapter.Finalize(s.writer)
 	return s.result(s.writer.Disconnected()), nil
@@ -289,10 +237,6 @@ func (s *antigravityCompatStreamSession) emitOrBuffer(event apicompat.AnthropicS
 	s.meaningfulData = true
 	ms := int(time.Since(s.startTime).Milliseconds())
 	s.firstTokenMs = &ms
-	s.flushPendingEvents()
-}
-
-func (s *antigravityCompatStreamSession) flushPendingEvents() {
 	for i := range s.pendingEvents {
 		s.adapter.Emit(&s.pendingEvents[i], s.writer)
 	}
@@ -305,13 +249,16 @@ func isMeaningfulAntigravityCompatEvent(event *apicompat.AnthropicStreamEvent) b
 	}
 	if event.ContentBlock != nil {
 		block := event.ContentBlock
-		return (block.Type == "tool_use" && block.Name != "") ||
+		return block.Type == "tool_use" ||
 			block.Text != "" ||
+			block.Thinking != "" ||
 			block.Source != nil
 	}
 	if event.Delta != nil {
 		delta := event.Delta
-		return delta.Text != "" || delta.PartialJSON != ""
+		return delta.Text != "" ||
+			delta.PartialJSON != "" ||
+			delta.Thinking != ""
 	}
 	return false
 }
@@ -334,7 +281,6 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStream(
 	originalModel string,
 	adapter antigravityCompatStreamAdapter,
 	prefix string,
-	retry ...func() (*http.Response, error),
 ) (*antigravityStreamResult, error) {
 	return s.handleAntigravityCompatStreamWithKeepaliveInterval(
 		c,
@@ -345,7 +291,6 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStream(
 		prefix,
 		antigravityCompatPreContentKeepaliveInterval,
 		s.antigravityCompatPreContentMaxWait(),
-		retry...,
 	)
 }
 
@@ -359,7 +304,6 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStreamAfterHeaders(
 	originalModel string,
 	adapter antigravityCompatStreamAdapter,
 	prefix string,
-	retry ...func() (*http.Response, error),
 ) (*antigravityStreamResult, error) {
 	return s.handleAntigravityCompatStreamWithTiming(
 		c,
@@ -371,22 +315,19 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStreamAfterHeaders(
 		prefix,
 		s.antigravityCompatPreContentKeepaliveInterval(),
 		s.antigravityCompatPreContentMaxWait(),
-		retry...,
 	)
 }
 
 func (s *AntigravityGatewayService) handleAntigravityCompatStreamWithKeepaliveInterval(
 	c *gin.Context, resp *http.Response, startTime time.Time, originalModel string,
 	adapter antigravityCompatStreamAdapter, prefix string, interval, maxPreContentWait time.Duration,
-	retry ...func() (*http.Response, error),
 ) (*antigravityStreamResult, error) {
-	return s.handleAntigravityCompatStreamWithTiming(c, resp, startTime, startTime, originalModel, adapter, prefix, interval, maxPreContentWait, retry...)
+	return s.handleAntigravityCompatStreamWithTiming(c, resp, startTime, startTime, originalModel, adapter, prefix, interval, maxPreContentWait)
 }
 
 func (s *AntigravityGatewayService) handleAntigravityCompatStreamWithTiming(
 	c *gin.Context, resp *http.Response, startTime, streamStart time.Time, originalModel string,
 	adapter antigravityCompatStreamAdapter, prefix string, interval, maxPreContentWait time.Duration,
-	retry ...func() (*http.Response, error),
 ) (*antigravityStreamResult, error) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
@@ -405,9 +346,7 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStreamWithTiming(
 	session.preContentKeepaliveSent = IsResponseCommitted(c) && c.Writer.Written()
 	session.preContentKeepaliveInterval = interval
 	events, stopScanner, maxLineSize, queueBudget := s.startAntigravityCompatScanner(resp.Body)
-	// stopScanner/resp are reassigned on fork stream retry; close the current ones.
-	defer func() { stopScanner(); _ = resp.Body.Close() }()
-	attempts := 1
+	defer stopScanner()
 
 	timeout := s.antigravityCompatStreamTimeout()
 	timeoutTimer, timeoutCh := newAntigravityCompatTimer(timeout)
@@ -440,13 +379,11 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStreamWithTiming(
 			writeAntigravityCompatStreamError(c, adapter, writer, "stream_timeout")
 			return session.collectResult(false), newAntigravityCompatCommittedNoContentError("pre-content stream timeout")
 		}
-		return nil, antigravityCompatEmptyStreamError(session.processor.MalformedFunctionCallOnly())
+		return nil, antigravityCompatEmptyStreamError()
 	}
 
 	for {
 		select {
-		case <-c.Request.Context().Done():
-			return session.collectResult(true), nil
 		case event, open := <-events:
 			if open {
 				queueBudget.release(len(event.line))
@@ -456,52 +393,6 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStreamWithTiming(
 			}
 			if !open {
 				if !session.hasMeaningfulData() && !writer.Disconnected() {
-					if len(retry) > 0 && retry[0] != nil {
-						// Only comments have reached the client. It is safe to replace
-						// the upstream even when the heartbeat committed HTTP 200.
-						if attempts < antigravityCompatMaxStreamAttempts && !isGeminiContentFilterFinishReason(session.terminalReason) {
-							stopScanner()
-							_ = resp.Body.Close()
-							attempts++
-							logger.LegacyPrintf("service.antigravity_gateway", "Retrying content-less compatibility stream attempt=%d reason=%s", attempts, session.terminalReason)
-							backoff := antigravityCompatRetryBackoff()
-							select {
-							case <-c.Request.Context().Done():
-								return session.collectResult(true), nil
-							case <-time.After(backoff):
-							}
-							next, retryErr := retry[0]()
-							if c.Request.Context().Err() != nil {
-								if next != nil {
-									_ = next.Body.Close()
-								}
-								return session.collectResult(true), nil
-							}
-							if retryErr == nil && next != nil && next.StatusCode < 400 {
-								resp = next
-								adapter = freshAntigravityCompatAdapter(adapter)
-								session = newAntigravityCompatStreamSession(originalModel, startTime, adapter, writer)
-								session.preContentKeepaliveInterval = interval
-								session.preContentKeepaliveSent = c.Writer.Written()
-								events, stopScanner, maxLineSize, queueBudget = s.startAntigravityCompatScanner(resp.Body)
-								resetAntigravityCompatTimer(timeoutTimer, timeout)
-								continue
-							}
-							if next != nil {
-								logger.LegacyPrintf("service.antigravity_gateway", "Compatibility stream recovery failed attempt=%d status=%d", attempts, next.StatusCode)
-								_ = next.Body.Close()
-							}
-							if retryErr != nil {
-								logger.LegacyPrintf("service.antigravity_gateway", "Compatibility stream recovery failed attempt=%d error=%s", attempts, sanitizeUpstreamErrorMessage(retryErr.Error()))
-							}
-						}
-						// Stop here instead of multiplying internal attempts by the
-						// handler's same-account retry loop.
-						if c.Writer.Written() {
-							return session.committedEmptyStream()
-						}
-						return nil, s.writeAntigravityCompatError(c, http.StatusBadGateway, "upstream_error", "empty_stream")
-					}
 					return handleAntigravityCompatEmptyStream(c, session)
 				}
 				return session.finish()
@@ -544,31 +435,12 @@ func (s *AntigravityGatewayService) handleAntigravityCompatStreamWithTiming(
 	}
 }
 
-func freshAntigravityCompatAdapter(adapter antigravityCompatStreamAdapter) antigravityCompatStreamAdapter {
-	switch a := adapter.(type) {
-	case *antigravityChatStreamAdapter:
-		return newAntigravityChatStreamAdapter(a.chatState.Model, a.chatState.IncludeUsage)
-	case *antigravityResponsesStreamAdapter:
-		return newAntigravityResponsesStreamAdapter(a.anthropicState.Model)
-	default:
-		return adapter
-	}
-}
-
 func handleAntigravityCompatEmptyStream(c *gin.Context, session *antigravityCompatStreamSession) (*antigravityStreamResult, error) {
 	if session.preContentKeepaliveSent {
 		writeAntigravityCompatStreamError(c, session.adapter, session.writer, "empty_stream")
 		return session.collectResult(false), newAntigravityCompatCommittedNoContentError("empty Antigravity compatibility stream after keepalive")
 	}
-	return nil, antigravityCompatEmptyStreamError(session.processor.MalformedFunctionCallOnly())
-}
-
-// committedEmptyStream reports an empty stream after HTTP 200 is already
-// committed. The SSE frame must be a real error event: a bare close is counted
-// as a successful completion by downstream proxies.
-func (s *antigravityCompatStreamSession) committedEmptyStream() (*antigravityStreamResult, error) {
-	s.adapter.WriteError(s.writer, "empty_stream")
-	return s.result(false), newAntigravityCompatCommittedNoContentError("empty Antigravity compatibility stream after keepalive")
+	return nil, antigravityCompatEmptyStreamError()
 }
 
 func (s *AntigravityGatewayService) startAntigravityCompatScanner(
@@ -586,7 +458,6 @@ func (s *AntigravityGatewayService) startAntigravityCompatScanner(
 	queueBudget := newSSEQueueBudget(s.antigravitySSEConfig())
 	events := make(chan antigravityCompatScanEvent, 16)
 	done := make(chan struct{})
-	var stopOnce sync.Once
 	go func() {
 		defer putSSEScannerBuf64K(scanBuf)
 		defer close(events)
@@ -611,7 +482,7 @@ func (s *AntigravityGatewayService) startAntigravityCompatScanner(
 			send(antigravityCompatScanEvent{err: err})
 		}
 	}()
-	return events, func() { stopOnce.Do(func() { close(done) }) }, maxLineSize, queueBudget
+	return events, func() { close(done) }, maxLineSize, queueBudget
 }
 
 func (s *AntigravityGatewayService) antigravityCompatStreamTimeout() time.Duration {
@@ -684,7 +555,7 @@ func (s *AntigravityGatewayService) handleAntigravityCompatReadError(
 			writeAntigravityCompatStreamError(c, session.adapter, session.writer, "stream_read_error")
 			return session.collectResult(false), fmt.Errorf("stream read error: %w", err)
 		}
-		return nil, antigravityCompatEmptyStreamError(session.processor.MalformedFunctionCallOnly())
+		return nil, antigravityCompatEmptyStreamError()
 	}
 	if disconnect, handled := handleStreamReadError(err, session.writer.Disconnected(), prefix); handled {
 		return session.collectResult(disconnect), nil
@@ -708,18 +579,12 @@ func writeAntigravityCompatStreamError(
 	MarkResponseCommitted(c)
 }
 
-func antigravityCompatEmptyStreamError(switchAccount bool) error {
+func antigravityCompatEmptyStreamError() error {
 	logger.LegacyPrintf("service.antigravity_gateway", "Empty Antigravity compatibility stream, triggering failover")
-	body := []byte(`{"error":"empty stream response from upstream"}`)
-	if switchAccount {
-		body = []byte(`{"error":"malformed function call from upstream"}`)
-	}
 	return &UpstreamFailoverError{
 		StatusCode:             http.StatusBadGateway,
-		ResponseBody:           body,
+		ResponseBody:           []byte(`{"error":"empty stream response from upstream"}`),
 		RetryableOnSameAccount: true,
-		RequestScopedTransient: true,
-		NextAccountAction:      NextAccountStop,
 	}
 }
 

@@ -82,8 +82,7 @@ type GeminiImageConfig struct {
 	ImageSize   string `json:"imageSize,omitempty"`   // "1K", "2K", "4K"
 }
 
-// GeminiThinkingConfig Gemini thinking 配置。
-// Gemini 3.x 用 ThinkingLevel，不写 ThinkingBudget；更早的模型仍用 ThinkingBudget。
+// GeminiThinkingConfig Gemini thinking 配置
 type GeminiThinkingConfig struct {
 	IncludeThoughts bool   `json:"includeThoughts"`
 	ThinkingBudget  int    `json:"thinkingBudget,omitempty"`

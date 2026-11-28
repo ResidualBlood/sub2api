@@ -36,12 +36,11 @@ type StreamingProcessor struct {
 	usageMapHook      UsageMapHook
 
 	// 累计 usage
-	inputTokens               int
-	outputTokens              int
-	cacheReadTokens           int
-	imageOutputTokens         int
-	hasContent                bool
-	malformedFunctionCallOnly bool
+	inputTokens       int
+	outputTokens      int
+	cacheReadTokens   int
+	imageOutputTokens int
+	hasContent        bool
 }
 
 // NewStreamingProcessor 创建流式响应处理器
@@ -150,11 +149,6 @@ func (p *StreamingProcessor) ProcessLine(line string) []byte {
 					log.Printf("[Antigravity] Malformed content: %s", string(b))
 				}
 			}
-			// A signature-only malformed call is not a transient transport failure.
-			// Same-account retries replay the same body and return the same packet.
-			if !p.hasContent {
-				p.malformedFunctionCallOnly = true
-			}
 		}
 		if finishReason != "" {
 			_, _ = result.Write(p.emitFinish(finishReason))
@@ -195,13 +189,6 @@ func (p *StreamingProcessor) MessageStartSent() bool {
 // HasContent reports whether any substantive text, thinking, or tool calls were emitted.
 func (p *StreamingProcessor) HasContent() bool {
 	return p.hasContent
-}
-
-// MalformedFunctionCallOnly reports a terminal MALFORMED_FUNCTION_CALL that
-// carried no text, thinking, or tool call. Replaying it on the same account
-// does not change the upstream packet.
-func (p *StreamingProcessor) MalformedFunctionCallOnly() bool {
-	return p.malformedFunctionCallOnly && !p.hasContent
 }
 
 // emitMessageStart 发送 message_start 事件
